@@ -5,7 +5,7 @@ export interface AgentMessage {
   fromAgent: string;
   toAgent: string;
   content: string;
-  type: 'query' | 'response' | 'user' | 'assistant';
+  type: 'query' | 'response' | 'user' | 'assistant' | 'error';
   timestamp: number;
   threadId: string;
 }

@@ -1,5 +1,3 @@
-import { openai } from '../config';
-import { createLog } from '../../logging';
 import { addAgentMessage } from '../messages';
 import { ASSISTANT_2_ID } from '../config';
 import { supabase } from '../../supabase';
@@ -13,6 +11,7 @@ interface SearchAttempt {
   errorType?: 'timeout' | 'syntax' | 'no_results' | 'execution' | 'validation';
   executionTime?: number;
   matchCount?: number;
+  search_token?: string;
   bestMatch?: {
     term: string;
     similarity: number;
@@ -60,146 +59,80 @@ function validateQuery(query: string): { isValid: boolean; error?: string } {
   return { isValid: true };
 }
 
-async function getAISearchStrategy(term: string, previousAttempts: SearchAttempt[]): Promise<string> {
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4",
-    messages: [
-      {
-        role: "system",
-        content: `Eres un experto en SQL y búsqueda de productos. 
-                 Analiza los intentos previos y genera una consulta SQL mejorada.
-                 
-                 REGLAS CRÍTICAS:
-                 1. La query DEBE comenzar con SELECT
-                 2. DEBE usar la tabla price_data
-                 3. NO se permiten operaciones de modificación (INSERT, UPDATE, DELETE, etc)
-                 4. La query debe seguir este formato:
-                    SELECT 
-                      nombre_generico,
-                      precio_promedio,
-                      unidad,
-                      division,
-                      grupo,
-                      clase,
-                      subclase
-                    FROM price_data
-                    WHERE nombre_generico ILIKE '%$TERM%'
-                    ORDER BY precio_promedio ASC
-                    LIMIT $LIMIT
-                 
-                 Estructura de la tabla price_data:
-                 - nombre_generico (text)
-                 - precio_promedio (decimal)
-                 - unidad (text)
-                 - division (text)
-                 - grupo (text)
-                 - clase (text)
-                 - subclase (text)
-
-                 ANÁLISIS DE ERRORES:
-                 1. Timeout:
-                    - Reduce la complejidad de WHERE
-                    - Disminuye el LIMIT
-                    - Simplifica el ORDER BY
-                 
-                 2. Sin resultados:
-                    - Usa ILIKE con comodines más flexibles
-                    - Simplifica condiciones WHERE
-                    - Usa OR en lugar de AND
-                 
-                 3. Error de sintaxis:
-                    - Verifica paréntesis
-                    - Usa aliases explícitos
-                    - Simplifica expresiones
-                 
-                 4. Demasiados resultados:
-                    - Agrega filtros específicos
-                    - Reduce el LIMIT
-
-                 IMPORTANTE:
-                 - SIEMPRE usa la tabla price_data
-                 - NUNCA uses operaciones de modificación
-                 - Mantén la query simple y legible
-                 - Usa comentarios para explicar cambios`
-      },
-      {
-        role: "user",
-        content: `Término de búsqueda: "${term}"
-                 
-                 ${previousAttempts.map((attempt, index) => `
-                 === INTENTO ${attempt.attempt} ===
-                 Query:
-                 ${attempt.query}
-                 
-                 Resultado:
-                 - Éxito: ${attempt.success}
-                 - Tiempo: ${attempt.executionTime || 'N/A'}ms
-                 - Resultados: ${attempt.results.length}
-                 ${attempt.bestMatch ? 
-                   `- Mejor match: ${attempt.bestMatch.term} (${(attempt.bestMatch.similarity * 100).toFixed(1)}%)` 
-                   : ''}
-                 ${attempt.error ? 
-                   `- Error: ${attempt.error}
-                    - Tipo: ${attempt.errorType}` 
-                   : ''}
-                 
-                 Análisis:
-                 ${index > 0 ? `- Cambios desde intento anterior:
-                   ${attempt.query !== previousAttempts[index-1].query ? 
-                     '  * Query modificada' : '  * Misma query'}
-                   ${attempt.error ? 
-                     `  * Nuevo error: ${attempt.error}` : 
-                     attempt.results.length === 0 ? 
-                     '  * Sin resultados' :
-                     `  * ${attempt.results.length} resultados`}` 
-                   : '- Primer intento'}
-                 `).join('\n')}
-                 
-                 Genera una nueva query SELECT usando la tabla price_data.
-                 
-                 Ejemplo de query válida:
-                 SELECT 
-                   nombre_generico,
-                   precio_promedio,
-                   unidad,
-                   division,
-                   grupo,
-                   clase,
-                   subclase
-                 FROM price_data
-                 WHERE nombre_generico ILIKE '%${term}%'
-                 ORDER BY precio_promedio ASC
-                 LIMIT 20;`
-      }
-    ],
-    temperature: 0.7,
-    max_tokens: 1000,
-    response_format: { type: "text" }
-  });
-
-  const query = completion.choices[0].message.content?.trim() || '';
+// Generate a search query based on the term without using AI
+function generateSearchQuery(term: string, attemptNumber: number): string {
+  // Sanitize the term
+  const sanitizedTerm = term.replace(/[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ\s]/g, '').trim();
   
-  // Validar la query antes de devolverla
-  const validation = validateQuery(query);
-  if (!validation.isValid) {
-    // Si la query no es válida, usar una query segura por defecto
-    return `
-      SELECT 
-        nombre_generico,
-        precio_promedio,
-        unidad,
-        division,
-        grupo,
-        clase,
-        subclase
-      FROM price_data
-      WHERE nombre_generico ILIKE '%${term}%'
-      ORDER BY precio_promedio ASC
-      LIMIT 20
-    `.trim();
+  // Different query strategies based on attempt number
+  switch (attemptNumber) {
+    case 1:
+      // First attempt: Simple exact match
+      return `
+        SELECT 
+          nombre_generico,
+          precio_promedio,
+          unidad,
+          division,
+          grupo,
+          clase,
+          subclase
+        FROM price_data
+        WHERE lower(unaccent(nombre_generico)) = lower(unaccent('${sanitizedTerm}'))
+        ORDER BY precio_promedio ASC
+        LIMIT 10
+      `;
+    
+    case 2:
+      // Second attempt: Partial match with ILIKE
+      return `
+        SELECT 
+          nombre_generico,
+          precio_promedio,
+          unidad,
+          division,
+          grupo,
+          clase,
+          subclase
+        FROM price_data
+        WHERE lower(unaccent(nombre_generico)) ILIKE '%${sanitizedTerm}%'
+        ORDER BY precio_promedio ASC
+        LIMIT 15
+      `;
+    
+    case 3:
+      // Third attempt: Fuzzy match with similarity
+      return `
+        SELECT 
+          nombre_generico,
+          precio_promedio,
+          unidad,
+          division,
+          grupo,
+          clase,
+          subclase,
+          similarity(lower(unaccent(nombre_generico)), lower(unaccent('${sanitizedTerm}'))) as sim
+        FROM price_data
+        WHERE similarity(lower(unaccent(nombre_generico)), lower(unaccent('${sanitizedTerm}'))) > 0.3
+        ORDER BY sim DESC, precio_promedio ASC
+        LIMIT 20
+      `;
+    
+    default:
+      // Fallback to using the built-in search function
+      return `
+        SELECT 
+          nombre_generico,
+          precio_promedio,
+          unidad,
+          division,
+          grupo,
+          clase,
+          subclase
+        FROM search_ingredients_v3('${sanitizedTerm}', 0.3)
+        LIMIT 20
+      `;
   }
-
-  return query;
 }
 
 async function logSearchAttempt(context: SearchContext, query: string, term: string) {
@@ -247,7 +180,7 @@ async function logSearchError(context: SearchContext, error: string, errorType: 
       error,
       errorType
     }),
-    type: 'error',
+    type: 'query', // Changed from 'error' to 'query' to match the allowed types
     timestamp: Date.now(),
     threadId: context.threadId
   });
@@ -257,15 +190,21 @@ async function executeSearch(term: string, context: SearchContext): Promise<any[
   const startTime = Date.now();
   
   try {
-    const query = await getAISearchStrategy(term, context.attempts);
+    // Generate query based on attempt number without using AI
+    const attemptNumber = context.attempts.filter(a => 
+      a.search_token === term || a.search_token === undefined
+    ).length + 1;
     
-    // Preparar el intento actual
+    const query = generateSearchQuery(term, attemptNumber);
+    
+    // Prepare the current attempt
     const currentAttempt: SearchAttempt = {
       attempt: context.attempts.length + 1,
       query,
       results: [],
       success: false,
-      executionTime: 0
+      executionTime: 0,
+      search_token: term
     };
     
     await logSearchAttempt(context, query, term);
@@ -291,10 +230,10 @@ async function executeSearch(term: string, context: SearchContext): Promise<any[
     currentAttempt.success = true;
     
     if (results.length > 0) {
-      const bestMatch = results[0]; // Ya está ordenado por precio
+      const bestMatch = results[0]; // Already sorted by price or similarity
       currentAttempt.bestMatch = {
         term: bestMatch.nombre_generico,
-        similarity: 1.0 // Exact match from ILIKE
+        similarity: bestMatch.similarity || 1.0
       };
     }
 
@@ -353,10 +292,17 @@ export async function recursiveSearch(threadId: string, ingredients: string): Pr
         if (validResults.length > 0) {
           termFound = true;
           context.foundTerms.add(term);
-          allResults.push(...validResults);
+          
+          // Add search_token to each result if not present
+          const resultsWithToken = validResults.map(result => ({
+            ...result,
+            search_token: term
+          }));
+          
+          allResults.push(...resultsWithToken);
           await logSearchResults(context, validResults);
         } else if (results.length > 0) {
-          // Si hay resultados pero no son válidos, registrar como error de validación
+          // If there are results but none are valid, register as validation error
           await logSearchError(
             context, 
             `Found ${results.length} results but none met validation criteria`,
